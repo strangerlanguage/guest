@@ -3,5 +3,5 @@
 version = 3
 
 [[package]]
-name = "guest"
-version = "0.1.0"
+name = "guest-server"
+version = "0.1.1"

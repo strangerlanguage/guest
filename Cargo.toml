@@ -1,6 +1,11 @@
 [package]
-name = "guest"
-version = "0.1.0"
+name = "guest-server"
+version = "0.1.1"
 edition = "2021"
+description = "A simple HTTP server implementation"
+license = "MIT"
+repository = "https://github.com/guestOfficer/guest"
+homepage = "https://github.com/guestOfficer/guest"
+documentation = "https://docs.rs/guest-server"
 
 [dependencies]

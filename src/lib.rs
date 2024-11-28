@@ -5,11 +5,11 @@ use std::{
     sync::{Arc, Mutex},
     thread,
 };
-/// 一个简单的 HTTP 服务器实现。
+/// A simple HTTP server implementation.
 ///
-/// # 示例
+/// # Example
 ///
-/// 创建服务器实例并注册一个 GET 路由：
+/// Create a server instance and register a GET route:
 ///
 /// ```rust
 /// use guest::Server;
@@ -18,9 +18,9 @@ use std::{
 /// server.get("/", || "HTTP/1.1 200 OK\r\n\r\nHello, World!".to_string());
 /// ```
 ///
-/// # 说明
-/// 这个简单的例子展示了如何创建一个 `Server` 实例，
-/// 注册一个 GET 路由，并模拟 HTTP 请求获取响应。
+/// # Description
+/// This simple example shows how to create a 'Server' instance.
+/// Register a GET route and simulate the HTTP request to get the response.
 pub struct Server {
     router: Arc<Mutex<HashMap<String, Arc<dyn Fn() -> String + Send + Sync + 'static>>>>,
 }

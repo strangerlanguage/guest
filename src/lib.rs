@@ -1,10 +1,11 @@
 use std::{
     collections::HashMap,
     io::{prelude::*, BufReader},
-    net::{TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream},
     sync::{Arc, Mutex},
     thread,
 };
+
 /// A simple HTTP server implementation.
 ///
 /// # Example
@@ -12,10 +13,18 @@ use std::{
 /// Create a server instance and register a GET route:
 ///
 /// ```rust
-/// use guest::Server;
+/// use guest_server::Server;
+/// use std::time::Duration;
+/// use std::thread;
 ///
 /// let mut server = Server::new();
-/// server.get("/", || "HTTP/1.1 200 OK\r\n\r\nHello, World!".to_string());
+/// server.get("/", home);
+///
+/// fn home()->String{
+///     format!("HTTP/1.1 200 OK\r\n\r\nHello, World!")
+/// }
+///
+/// server.listener(80);
 /// ```
 ///
 /// # Description
@@ -32,6 +41,9 @@ impl Server {
         }
     }
 
+    /// # parameter
+    /// - 'path' : indicates the route path to be registered, for example, '/home'
+    /// - 'handler' : handles the closure of the path request and returns a response of type String
     pub fn get<F>(&mut self, path: &str, handler: F)
     where
         F: Fn() -> String + Send + Sync + 'static,
@@ -42,43 +54,70 @@ impl Server {
             .insert(path.to_string(), Arc::new(handler));
     }
 
-    pub fn listener(&self, address: &str) {
-        let listener = TcpListener::bind(address).unwrap();
+    /// # parameter
+    /// - 'port' : indicates the port number to listen
+    pub fn listener(&self, port: u16) {
+        let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let listener = TcpListener::bind(addr).unwrap();
+
+        // Listen for incoming connections
         for stream in listener.incoming() {
-            let router = Arc::clone(&self.router);
-            let stream = stream.unwrap();
-            thread::spawn(move || {
-                let server = Server { router };
-                server.handle_connection(stream);
-            });
+            match stream {
+                Ok(stream) => {
+                    let router = Arc::clone(&self.router);
+                    // Handle each connection in a separate thread
+                    thread::spawn(move || {
+                        let server = Server { router };
+                        server.handle_connection(stream);
+                    });
+                }
+                Err(e) => eprintln!("Failed to accept connection: {}", e),
+            }
         }
     }
 
-    pub fn handle_connection(&self, mut stream: TcpStream) {
+    /// Handle the HTTP connection.
+    fn handle_connection(&self, mut stream: TcpStream) {
         let buf_reader = BufReader::new(&mut stream);
 
-        if let Some(line) = buf_reader.lines().next() {
-            let line = line.unwrap();
-            let parts: Vec<&str> = line.split(' ').collect();
+        // Read the first line of the request
+        if let Some(Ok(line)) = buf_reader.lines().next() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+
+            if parts.len() < 2 {
+                // Invalid request line
+                self.send_response(
+                    &mut stream,
+                    "HTTP/1.1 400 Bad Request\r\n\r\n400 Bad Request",
+                );
+                return;
+            }
 
             let method = parts[0];
             let path = parts[1];
 
             const NOT_FOUND_RESPONSE: &str = "HTTP/1.1 404 NOT FOUND\r\n\r\n404 Not Found";
 
-            let handler_opt = {
-                let router = self.router.lock().unwrap();
-                router.get(path).cloned()
-            };
-
+            // Lock router once and handle request
             let response = match method {
-                "GET" => handler_opt
-                    .map(|handler| handler())
-                    .unwrap_or_else(|| NOT_FOUND_RESPONSE.to_string()),
+                "GET" => {
+                    let handler = self.router.lock().unwrap().get(path).cloned();
+                    handler
+                        .map(|h| h())
+                        .unwrap_or_else(|| NOT_FOUND_RESPONSE.to_string())
+                }
                 _ => NOT_FOUND_RESPONSE.to_string(),
             };
 
-            stream.write_all(response.as_bytes()).unwrap();
+            // Send the response back to the client
+            self.send_response(&mut stream, &response);
+        }
+    }
+
+    /// Send an HTTP response to the client.
+    fn send_response(&self, stream: &mut TcpStream, response: &str) {
+        if let Err(e) = stream.write_all(response.as_bytes()) {
+            eprintln!("Failed to send response: {}", e);
         }
     }
 }

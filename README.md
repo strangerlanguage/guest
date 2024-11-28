@@ -17,3 +17,4 @@ use guest_server::Server;
 
 let mut server = Server::new();
 server.get("/", || "HTTP/1.1 200 OK\r\n\r\nHello, World!".to_string());
+server.listener("127.0.0.1:8080");

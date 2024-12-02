@@ -21,7 +21,7 @@ use std::{
 /// server.get("/", home);
 ///
 /// fn home()->HttpResponse{
-///     HttpResponse::Body(String::from("Hello, World!"))
+///      HttpResponse::new(200, Some("Hello, World!".to_string()))
 /// }
 ///
 /// server.listener(80);
@@ -29,55 +29,24 @@ use std::{
 ///
 /// # Description
 /// This simple example shows how to create a 'Server' instance.
-/// Register a GET route and simulate the HTTP request to get the response.
+/// Registers a GET route and simulates an HTTP request to obtain the response.
 pub struct Server {
     router: Arc<Mutex<HashMap<String, Arc<dyn Fn() -> HttpResponse + Send + Sync + 'static>>>>,
 }
 
-pub enum HttpResponse {
-    StatusCode(u16),
-    Body(String),
-}
-
-impl HttpResponse {
-    // Returns the status message associated with a status code.
-    pub fn status_message(&self) -> (&'static str, &'static str) {
-        match self {
-            HttpResponse::StatusCode(200) => ("OK", "Request was successful"),
-            HttpResponse::StatusCode(400) => {
-                ("Bad Request", "The request was invalid or malformed")
-            }
-            HttpResponse::StatusCode(404) => {
-                ("Not Found", "The requested resource could not be found")
-            }
-            HttpResponse::StatusCode(500) => {
-                ("Internal Server Error", "The server encountered an error")
-            }
-            _ => ("Unknown", "An unknown error occurred"),
-        }
-    }
-    // Returns the HTTP status code.
-    pub fn status_code(&self) -> u16 {
-        match self {
-            HttpResponse::StatusCode(code) => *code,
-            _ => 200,
-        }
-    }
-}
-
 impl Server {
-    /// Creates a new server instance.
+    /// Creates and initializes a new server instance.
     pub fn new() -> Self {
         Self {
             router: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Registers a GET route with a path and handler.
+    /// Registers a GET route with a specified path and handler.
     ///
     /// # Parameters
-    /// - 'path' : The route path to be registered, e.g., '/home'.
-    /// - 'handler' : The closure that handles the path request and returns an `HttpResponse`.
+    /// - 'path' : The route path to register, e.g., '/home'.
+    /// - 'handler' : The closure that processes the request for this path and returns an HttpResponse.
     pub fn get<F>(&mut self, path: &str, handler: F)
     where
         F: Fn() -> HttpResponse + Send + Sync + 'static,
@@ -132,8 +101,8 @@ impl Server {
             let method = parts[0];
             let path = parts[1];
 
-            // 默认响应，如果找不到对应的处理函数
-            let not_found_response = HttpResponse::Body(String::from("Hello, world!"));
+            // Invalid request line
+            let not_found_response = HttpResponse::new(400, None);
 
             // Lock router once and handle request
             let response = match method {
@@ -158,17 +127,88 @@ impl Server {
 
     // Generates the full HTTP response as a string, including headers and body.
     fn generate_http_response(response: &HttpResponse) -> String {
-        let (status_message, default_body) = response.status_message();
-        let body = match response {
-            HttpResponse::Body(b) => b,
-            _ => &default_body.to_owned(),
+        let mut response_string = format!(
+            "HTTP/1.1 {} {}\r\n",
+            response.status_code,
+            response.get_status_message()
+        );
+        for (key, value) in &response.headers {
+            response_string.push_str(&format!("{}: {}\r\n", key, value));
+        }
+        response_string.push_str("\r\n");
+
+        if let Some(body) = &response.body {
+            response_string.push_str(body);
+        }
+
+        response_string
+    }
+}
+
+pub struct HttpResponse {
+    pub status_code: u16,
+    pub headers: HashMap<String, String>,
+    pub body: Option<String>,
+}
+
+impl HttpResponse {
+    /// Create a default HttpResponse.
+    /// Defaults: Status code 200, headers Content-Type and Content-Length.
+    ///
+    /// # Parameters
+    /// - 'status_code' : The request status code
+    /// - 'body' : The request body
+    pub fn new(status_code: u16, body: Option<String>) -> Self {
+        let mut headers = HashMap::new();
+        let default_content_type = if let Some(ref b) = body {
+            if b.starts_with('{') && b.ends_with('}') {
+                "application/json".to_string()
+            } else {
+                "text/plain".to_string()
+            }
+        } else {
+            "text/plain".to_string()
         };
-        format!(
-            "HTTP/1.1 {} {}\r\n\
-            {}",
-            response.status_code(),
-            status_message,
-            body
-        )
+        headers.insert("Content-Type".to_string(), default_content_type);
+        if let Some(ref b) = body {
+            headers.insert("Content-Length".to_string(), b.len().to_string());
+        }
+
+        HttpResponse {
+            status_code,
+            headers,
+            body,
+        }
+    }
+
+    /// Adds or updates a single header field.
+    ///
+    /// # Parameters
+    /// - 'key' : The request header key
+    /// - 'value' : The request header value
+    pub fn insert_header(mut self, key: &str, value: &str) -> Self {
+        self.headers.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    /// Add or overwrite header fields in batches.
+    ///
+    /// # Parameters
+    /// - 'new_headers' : The request headers
+    pub fn insert_headers(mut self, new_headers: HashMap<String, String>) -> Self {
+        self.headers.extend(new_headers);
+        self
+    }
+
+    /// Retrieves the description for the status code.
+    pub fn get_status_message(&self) -> &'static str {
+        match self.status_code {
+            200 => "OK",
+            201 => "Created",
+            400 => "Bad Request",
+            404 => "Not Found",
+            500 => "Internal Server Error",
+            _ => "Unknown Status",
+        }
     }
 }

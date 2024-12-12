@@ -4,8 +4,8 @@ version = "0.1.4"
 edition = "2021"
 description = "A simple HTTP server implementation"
 license = "MIT"
-repository = "https://github.com/guestOfficer/guest"
-homepage = "https://github.com/guestOfficer/guest"
+repository = "https://github.com/strangerlanguage/guest"
+homepage = "https://github.com/strangerlanguage/guest"
 documentation = "https://docs.rs/guest-server"
 
 [dependencies]

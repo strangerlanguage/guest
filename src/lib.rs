@@ -1,6 +1,7 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
-    io::{prelude::*, BufReader},
+    io::{prelude::*, Error, ErrorKind},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{Arc, RwLock},
     thread,
@@ -18,8 +19,8 @@ use std::{
 /// let mut server = Server::new();
 /// server.get("/", home);
 ///
-/// fn home()->HttpResponse{
-///      HttpResponse::new(200, Some("Hello, World!".to_string()))
+/// fn home(query_params: String) -> HttpResponse {
+///       HttpResponse::new(200, Some("Hello, World!".to_string()))
 /// }
 ///
 /// server.listener(80);
@@ -38,7 +39,7 @@ pub enum HttpMethod {
 pub struct Server {
     routes: Arc<
         RwLock<
-            HashMap<(HttpMethod, String), Arc<dyn Fn() -> HttpResponse + Send + Sync + 'static>>,
+            HashMap<(HttpMethod, String), Arc<dyn Fn(String) -> HttpResponse + Send + Sync + 'static>>,
         >,
     >,
 }
@@ -62,7 +63,7 @@ impl Server {
     /// - 'handler' : The closure that processes the request for this path.
     pub fn route<F>(&mut self, method: HttpMethod, path: &str, handler: F)
     where
-        F: Fn() -> HttpResponse + Send + Sync + 'static,
+        F: Fn(String) -> HttpResponse + Send + Sync + 'static,
     {
         self.routes
             .write()
@@ -77,7 +78,7 @@ impl Server {
     /// - 'handler' : The closure that processes the request for this path.
     pub fn get<F>(&mut self, path: &str, handler: F)
     where
-        F: Fn() -> HttpResponse + Send + Sync + 'static,
+        F: Fn(String) -> HttpResponse + Send + Sync + 'static,
     {
         self.route(HttpMethod::GET, path, handler);
     }
@@ -94,16 +95,16 @@ impl Server {
     /// use guest_server::{Server,HttpResponse};
     /// let mut server = Server::new();
     /// server.post("/submit",submit);
-    /// fn submit()->HttpResponse{
+    /// fn submit(body: String) -> HttpResponse {
     ///     HttpResponse::new(200, Some("{\"key\":\"value\"}".to_string())).insert_header("Content-Type","application/json")
     /// }
     /// server.listener(80);
     /// ```
     pub fn post<F>(&mut self, path: &str, handler: F)
     where
-        F: Fn() -> HttpResponse + Send + Sync + 'static,
+        F: Fn(String) -> HttpResponse + Send + Sync + 'static,
     {
-        self.route(HttpMethod::POST, path, handler);
+        self.route(HttpMethod::POST, path, move |body| handler(body));
     }
 
     /// Starts the server and listens for incoming connections on the specified port.
@@ -122,7 +123,7 @@ impl Server {
                     // Handle each connection in a separate thread
                     thread::spawn(move || {
                         let server = Server { routes };
-                        server.handle_connection(stream);
+                        server.handle_connection(stream).unwrap();
                     });
                 }
                 Err(e) => eprintln!("Failed to accept connection: {}", e),
@@ -130,50 +131,112 @@ impl Server {
         }
     }
 
+    /// Extracts the HTTP method, path, and content length from the request header.
+    ///
+    /// # Parameters
+    /// - `request`: A borrowed string slice of the HTTP request.
+    ///
+    /// # Returns
+    /// A tuple containing the optional HTTP method, path, and content length.
+    fn get_response_header<'a>(
+        request: &'a Cow<'_, str>,
+    ) -> Result<(Option<HttpMethod>, &'a str, usize), Error> {
+        let mut lines = request.lines();
+
+        match lines.next() {
+            Some(first_line) => {
+                let parts: Vec<&str> = first_line.split_whitespace().collect();
+                if parts.len() < 2 {
+                    return Err(Error::new(ErrorKind::InvalidData, "Invalid request header"));
+                }
+                let method_str = parts[0];
+                let path = parts[1];
+
+                let method = match method_str {
+                    "GET" => Some(HttpMethod::GET),
+                    "POST" => Some(HttpMethod::POST),
+                    _ => None,
+                };
+                let content_length = lines
+                    .find_map(|line| {
+                        if line.starts_with("Content-Length:") {
+                            line["Content-Length:".len()..].trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                Ok((method, path, content_length))
+            }
+            None => Err(Error::new(ErrorKind::InvalidData, "Empty request header")),
+        }
+    }
+
+    /// Parses the HTTP request body to extract key-value pairs.
+    ///
+    /// # Parameters
+    /// - `request`: A borrowed string slice of the HTTP request.
+    /// - `content_length`: The expected content length of the body.
+    ///
+    /// # Returns
+    /// A vector of key-value tuples parsed from the body.
+    fn get_response_body<'a>(
+        request: &'a Cow<'a, str>,
+        content_length: usize,
+    ) -> Result<Vec<(&'a str, &'a str)>, Error> {
+        match request.find("\r\n\r\n") {
+            Some(body_start) => {
+                let body = &request[body_start + 4..body_start + 4 + content_length];
+                let params: Vec<(&'a str, &'a str)> = body
+                    .split('&')
+                    .filter_map(|pair| {
+                        let mut parts = pair.split('=');
+                        if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+                            Some((key, value))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                Ok(params)
+            }
+            None => Err(Error::new(ErrorKind::InvalidData, "Malformed body content")),
+        }
+    }
+
     /// Handles the HTTP connection by reading the request and sending an appropriate response.
     ///
     /// # Parameters
     /// - 'stream' : The TCP stream for the current connection.
-    fn handle_connection(&self, mut stream: TcpStream) {
-        let buf_reader = BufReader::new(&mut stream);
+    fn handle_connection(&self, mut stream: TcpStream) -> Result<(), Error> {
+        let mut buf = [0; 1024];
+        match stream.read(&mut buf) {
+            Ok(_) => {
+                let request = String::from_utf8_lossy(&buf);
+                match Self::get_response_header(&request) {
+                    Ok((method, path, content_length)) => {
+                        let body = Self::get_response_body(&request, content_length).unwrap();
+                        let body_str = body.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
+                        let response = if let Some(method) = method {
+                            self.routes
+                                .read()
+                                .unwrap()
+                                .get(&(method, path.to_string()))
+                                .cloned()
+                                .map_or_else(|| HttpResponse::new(404, None), |h| h(body_str))
+                        } else {
+                            HttpResponse::new(405, None)
+                        };
 
-        // Read the first line of the request
-        if let Some(Ok(line)) = buf_reader.lines().next() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
+                        let res = Self::generate_http_response(&response);
+                        self.send_response(&mut stream, &res);
 
-            if parts.len() < 2 {
-                // Invalid request line
-                self.send_response(
-                    &mut stream,
-                    "HTTP/1.1 400 Bad Request\r\n\r\n400 Bad Request",
-                );
-                return;
+                        Ok(())
+                    }
+                    Err(_) => Err(Error::new(ErrorKind::InvalidData, "Invalid request header")),
+                }
             }
-
-            let method = parts[0];
-            let path = parts[1];
-
-            // Lock routes once and handle request
-            let method: Option<HttpMethod> = match method {
-                "GET" => Some(HttpMethod::GET),
-                "POST" => Some(HttpMethod::POST),
-                _ => None,
-            };
-
-            let response = if let Some(method) = method {
-                self.routes
-                    .read()
-                    .unwrap()
-                    .get(&(method, path.to_string()))
-                    .cloned()
-                    .map_or_else(|| HttpResponse::new(404, None), |h| h())
-            } else {
-                HttpResponse::new(405, None) // Method Not Allowed
-            };
-
-            let res = Self::generate_http_response(&response);
-            // Send the response back to the client
-            self.send_response(&mut stream, &res);
+            Err(error) => Err(error),
         }
     }
 

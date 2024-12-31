@@ -1,7 +1,6 @@
 use std::{
-    borrow::Cow,
     collections::HashMap,
-    io::{prelude::*, Error, ErrorKind},
+    io::{BufRead, BufReader, Error, ErrorKind, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{Arc, RwLock},
     thread,
@@ -19,7 +18,7 @@ use std::{
 /// let mut server = Server::new();
 /// server.get("/", home);
 ///
-/// fn home(query_params: String) -> HttpResponse {
+/// fn home(query_params: Option<Vec<u8>>) -> HttpResponse {
 ///       HttpResponse::new(200, Some("Hello, World!".to_string()))
 /// }
 ///
@@ -29,19 +28,30 @@ use std::{
 /// # Description
 /// This simple example shows how to create a 'Server' instance.
 /// Registers a GET route and simulates an HTTP request to obtain the response.
-#[derive(Eq, PartialEq, Hash)]
+
+#[derive(Eq, PartialEq, Hash, Clone)]
 pub enum HttpMethod {
     GET,
     POST,
 }
 
-/// Represents the HTTP server.
-pub struct Server {
-    routes: Arc<
-        RwLock<
-            HashMap<(HttpMethod, String), Arc<dyn Fn(String) -> HttpResponse + Send + Sync + 'static>>,
+type Routes = Arc<
+    RwLock<
+        HashMap<
+            (HttpMethod, String),
+            Arc<dyn Fn(Option<Vec<u8>>) -> HttpResponse + Send + Sync + 'static>,
         >,
     >,
+>;
+
+/// Represents an HTTP server.
+///
+/// This server listens for incoming HTTP requests, dispatches them to the correct handler based on the
+/// method and path, and sends back appropriate HTTP responses. It supports GET and POST routes.
+///
+/// The server is multi-threaded, handling each incoming connection in a new thread.
+pub struct Server {
+    routes: Routes, // A map storing routes and their associated handler functions.
 }
 
 impl Server {
@@ -61,9 +71,9 @@ impl Server {
     /// - 'method' : The HTTP method (GET, POST) for this route.
     /// - 'path' : The route path (e.g., '/home').
     /// - 'handler' : The closure that processes the request for this path.
-    pub fn route<F>(&mut self, method: HttpMethod, path: &str, handler: F)
+    fn route<F>(&mut self, method: HttpMethod, path: &str, handler: F)
     where
-        F: Fn(String) -> HttpResponse + Send + Sync + 'static,
+        F: Fn(Option<Vec<u8>>) -> HttpResponse + Send + Sync + 'static,
     {
         self.routes
             .write()
@@ -78,7 +88,7 @@ impl Server {
     /// - 'handler' : The closure that processes the request for this path.
     pub fn get<F>(&mut self, path: &str, handler: F)
     where
-        F: Fn(String) -> HttpResponse + Send + Sync + 'static,
+        F: Fn(Option<Vec<u8>>) -> HttpResponse + Send + Sync + 'static,
     {
         self.route(HttpMethod::GET, path, handler);
     }
@@ -95,16 +105,16 @@ impl Server {
     /// use guest_server::{Server,HttpResponse};
     /// let mut server = Server::new();
     /// server.post("/submit",submit);
-    /// fn submit(body: String) -> HttpResponse {
+    /// fn submit(body: Option<Vec<u8>>) -> HttpResponse {
     ///     HttpResponse::new(200, Some("{\"key\":\"value\"}".to_string())).insert_header("Content-Type","application/json")
     /// }
-    /// server.listener(80);
+    /// server.listener(8080);
     /// ```
     pub fn post<F>(&mut self, path: &str, handler: F)
     where
-        F: Fn(String) -> HttpResponse + Send + Sync + 'static,
+        F: Fn(Option<Vec<u8>>) -> HttpResponse + Send + Sync + 'static,
     {
-        self.route(HttpMethod::POST, path, move |body| handler(body));
+        self.route(HttpMethod::POST, path, handler);
     }
 
     /// Starts the server and listens for incoming connections on the specified port.
@@ -114,16 +124,15 @@ impl Server {
     pub fn listener(&self, port: u16) {
         let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
         let listener = TcpListener::bind(addr).unwrap();
-
         // Listen for incoming connections
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
                     let routes = Arc::clone(&self.routes);
-                    // Handle each connection in a separate thread
                     thread::spawn(move || {
-                        let server = Server { routes };
-                        server.handle_connection(stream).unwrap();
+                        if let Err(e) = Server::handle_connection(routes, stream) {
+                            eprintln!("Connection failed: {}", e);
+                        }
                     });
                 }
                 Err(e) => eprintln!("Failed to accept connection: {}", e),
@@ -131,122 +140,119 @@ impl Server {
         }
     }
 
-    /// Extracts the HTTP method, path, and content length from the request header.
+    /// Handles the incoming TCP connection, processes the HTTP request, and sends back a response.
     ///
     /// # Parameters
-    /// - `request`: A borrowed string slice of the HTTP request.
-    ///
-    /// # Returns
-    /// A tuple containing the optional HTTP method, path, and content length.
-    fn get_response_header<'a>(
-        request: &'a Cow<'_, str>,
-    ) -> Result<(Option<HttpMethod>, &'a str, usize), Error> {
-        let mut lines = request.lines();
+    /// - `routes`: The `Routes` object containing the routing information. This is used to match the
+    ///   incoming HTTP request's path and method to the appropriate handler function.
+    /// - `stream`: The TCP stream representing the connection to the client. This is used to read
+    ///   the request and send the response back to the client. The stream is mutable because it will
+    ///   be written to as part of generating the HTTP response.
+    fn handle_connection(routes: Routes, mut stream: TcpStream) -> Result<(), Error> {
+        let mut reader = BufReader::new(&stream);
+        let mut buffer_request = Vec::new();
+        let mut header_parsed = false;
+        let mut content_length = 0;
+        let mut method = Option::None;
+        let mut path = String::new();
 
-        match lines.next() {
-            Some(first_line) => {
-                let parts: Vec<&str> = first_line.split_whitespace().collect();
-                if parts.len() < 2 {
-                    return Err(Error::new(ErrorKind::InvalidData, "Invalid request header"));
-                }
-                let method_str = parts[0];
-                let path = parts[1];
+        loop {
+            let mut line = String::new();
+            let bytes_read = reader.read_line(&mut line)?;
 
-                let method = match method_str {
-                    "GET" => Some(HttpMethod::GET),
-                    "POST" => Some(HttpMethod::POST),
-                    _ => None,
-                };
-                let content_length = lines
-                    .find_map(|line| {
-                        if line.starts_with("Content-Length:") {
-                            line["Content-Length:".len()..].trim().parse::<usize>().ok()
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-                Ok((method, path, content_length))
+            if bytes_read == 0 {
+                break;
             }
-            None => Err(Error::new(ErrorKind::InvalidData, "Empty request header")),
-        }
-    }
 
-    /// Parses the HTTP request body to extract key-value pairs.
-    ///
-    /// # Parameters
-    /// - `request`: A borrowed string slice of the HTTP request.
-    /// - `content_length`: The expected content length of the body.
-    ///
-    /// # Returns
-    /// A vector of key-value tuples parsed from the body.
-    fn get_response_body<'a>(
-        request: &'a Cow<'a, str>,
-        content_length: usize,
-    ) -> Result<Vec<(&'a str, &'a str)>, Error> {
-        match request.find("\r\n\r\n") {
-            Some(body_start) => {
-                let body = &request[body_start + 4..body_start + 4 + content_length];
-                let params: Vec<(&'a str, &'a str)> = body
-                    .split('&')
-                    .filter_map(|pair| {
-                        let mut parts = pair.split('=');
-                        if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
-                            Some((key, value))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                Ok(params)
+            buffer_request.extend_from_slice(line.as_bytes());
+
+            if line == "\r\n" {
+                header_parsed = true;
+                break;
             }
-            None => Err(Error::new(ErrorKind::InvalidData, "Malformed body content")),
-        }
-    }
 
-    /// Handles the HTTP connection by reading the request and sending an appropriate response.
-    ///
-    /// # Parameters
-    /// - 'stream' : The TCP stream for the current connection.
-    fn handle_connection(&self, mut stream: TcpStream) -> Result<(), Error> {
-        let mut buf = [0; 1024];
-        match stream.read(&mut buf) {
-            Ok(_) => {
-                let request = String::from_utf8_lossy(&buf);
-                match Self::get_response_header(&request) {
-                    Ok((method, path, content_length)) => {
-                        let body = Self::get_response_body(&request, content_length).unwrap();
-                        let body_str = body.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
-                        let response = if let Some(method) = method {
-                            self.routes
-                                .read()
-                                .unwrap()
-                                .get(&(method, path.to_string()))
-                                .cloned()
-                                .map_or_else(|| HttpResponse::new(404, None), |h| h(body_str))
-                        } else {
-                            HttpResponse::new(405, None)
-                        };
-
-                        let res = Self::generate_http_response(&response);
-                        self.send_response(&mut stream, &res);
-
-                        Ok(())
-                    }
-                    Err(_) => Err(Error::new(ErrorKind::InvalidData, "Invalid request header")),
+            if line.starts_with("GET") || line.starts_with("POST") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    method = match parts[0] {
+                        "GET" => Some(HttpMethod::GET),
+                        "POST" => Some(HttpMethod::POST),
+                        _ => None,
+                    };
+                    path = parts[1].to_string();
                 }
             }
-            Err(error) => Err(error),
+
+            if line.to_lowercase().starts_with("content-length:") {
+                if let Ok(length) = line["content-length:".len()..].trim().parse::<usize>() {
+                    content_length = length;
+                }
+            }
         }
+
+        if !header_parsed {
+            return Err(Error::new(ErrorKind::InvalidData, "Incomplete header"));
+        }
+
+        let mut body = Vec::new();
+        if content_length > 0 {
+            body.resize(content_length, 0);
+            reader.read_exact(&mut body)?;
+        }
+
+        buffer_request.extend_from_slice(&body);
+
+        let response = if let Some(method) = method {
+            Server::processing_response(&routes, body, method, path)
+        } else {
+            HttpResponse::new(405, None)
+        };
+
+        let res = Server::generate_http_response(&response);
+        Server::send_response(&mut stream, res);
+
+        Ok(())
+    }
+
+    /// Processes the HTTP response based on the method and path, invoking the registered handler.
+    ///
+    /// # Parameters
+    /// - 'routes' : A shared reference to the routes configuration.
+    /// - 'body' : The body of the request as a vector of bytes.
+    /// - 'method' : The HTTP method (GET, POST) for the request.
+    /// - 'path' : The requested path for the route.
+    ///
+    /// # Returns
+    /// The generated HttpResponse based on the handler or a 404 response if no handler is found.
+
+    fn processing_response(
+        routes: &Routes,
+        body: Vec<u8>,
+        method: HttpMethod,
+        path: String,
+    ) -> HttpResponse {
+        routes
+            .read()
+            .unwrap()
+            .get(&(method, path))
+            .cloned()
+            .map_or_else(
+                || HttpResponse::new(404, None),
+                |handler| handler(Some(body)),
+            )
     }
 
     /// Sends an HTTP response to the client.
     ///
     /// # Parameters
     /// - 'stream' : The TCP stream to send the response over.
-    /// - 'response' : The response content (HTTP status, headers, body).
-    fn send_response(&self, stream: &mut TcpStream, response: &str) {
-        if let Err(e) = stream.write_all(response.as_bytes()) {
+    /// - 'response' : The response content (HTTP status, headers, body) to be sent.
+    ///
+    /// # Notes
+    /// This function writes the full HTTP response to the provided stream.
+    /// It logs an error if the response cannot be sent.
+    fn send_response(stream: &mut TcpStream, response: Vec<u8>) {
+        if let Err(e) = stream.write_all(&response) {
             eprintln!("Failed to send response: {}", e);
         }
     }
@@ -257,23 +263,24 @@ impl Server {
     /// - 'response' : The HttpResponse object containing status, headers, and body.
     ///
     /// # Returns
-    /// A string representing the full HTTP response.
-    fn generate_http_response(response: &HttpResponse) -> String {
+    /// A vector of bytes representing the full HTTP response.
+    fn generate_http_response(response: &HttpResponse) -> Vec<u8> {
         let mut response_string = format!(
             "HTTP/1.1 {} {}\r\n",
             response.status_code,
-            response.get_status_message()
+            response.get_status_message() // Retrieves the status message based on status code
         );
         for (key, value) in &response.headers {
-            response_string.push_str(&format!("{}: {}\r\n", key, value));
+            response_string.push_str(&format!("{}: {}\r\n", key, value)); // Add headers to the response
         }
         response_string.push_str("\r\n");
 
+        let mut res = response_string.into_bytes();
         if let Some(body) = &response.body {
-            response_string.push_str(body);
+            res.extend_from_slice(body.as_bytes()); // Append the response body if it exists
         }
 
-        response_string
+        res
     }
 }
 

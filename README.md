@@ -11,7 +11,7 @@ let mut server = Server::new();
 
 server.get("/", home);
 
-fn home(_: String) -> HttpResponse {
+fn home(query_params: Option<Vec<u8>>) -> HttpResponse {
         HttpResponse::new(200, Some("Hello, World!".to_string()))
 }
 

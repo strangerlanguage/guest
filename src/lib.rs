@@ -320,6 +320,26 @@ impl HttpResponse {
         }
     }
 
+    /// Adds Cross-Origin Resource Sharing (CORS) headers to the `HttpResponse`.
+    ///
+    /// This method sets the `Access-Control-Allow-Origin` header to `*`, allowing
+    /// requests from any origin. This is useful for enabling CORS in scenarios where
+    /// the response needs to be accessible across different domains.
+    ///
+    /// # Usage
+    ///
+    /// ```rust
+    /// let response = HttpResponse::new(200, Some("Hello, World!".to_string())).cors();
+    /// ```
+    ///
+    /// # Returns
+    /// - `Self`: The `HttpResponse` instance with the CORS header added.
+    pub fn cors(mut self) -> Self {
+        self.headers
+            .insert("Access-Control-Allow-Origin".to_string(), "*".to_string());
+        self
+    }
+
     /// Adds or updates a single header field.
     ///
     /// # Parameters
